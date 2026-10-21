@@ -1,0 +1,94 @@
+name: Build APK
+on:
+  push:
+    branches: [ main ]
+  schedule:
+    - cron: "0 5 * * 1,4"   # فحص تحديث المكتبات: الاثنين والخميس
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.7"
+
+      - name: Check library updates
+        id: bump
+        if: github.event_name != 'push'
+        run: |
+          F=app/build.gradle.kts
+          changed=false
+
+          cur_np=$(grep -oP 'NewPipeExtractor:\Kv[0-9.]+' $F || true)
+          new_np=$(curl -fsSL -H "Authorization: Bearer $GH_TOKEN" \
+            https://api.github.com/repos/TeamNewPipe/NewPipeExtractor/releases/latest | jq -r .tag_name || true)
+          if [ -n "$cur_np" ] && [ -n "$new_np" ] && [ "$new_np" != "null" ] && [ "$new_np" != "$cur_np" ] \
+             && [ "$(printf '%s\n%s\n' "$cur_np" "$new_np" | sort -V | tail -1)" = "$new_np" ]; then
+            sed -i "s|NewPipeExtractor:$cur_np|NewPipeExtractor:$new_np|" $F
+            changed=true
+            echo "NewPipeExtractor: $cur_np -> $new_np"
+          fi
+
+          cur_yd=$(grep -oP 'youtubedl-android:library:\K[0-9.]+' $F || true)
+          new_yd=$(curl -fsSL https://repo1.maven.org/maven2/io/github/junkfood02/youtubedl-android/library/maven-metadata.xml \
+            | grep -oP '<release>\K[^<]+' || true)
+          if [ -n "$cur_yd" ] && [ -n "$new_yd" ] && [ "$new_yd" != "$cur_yd" ] \
+             && [ "$(printf '%s\n%s\n' "$cur_yd" "$new_yd" | sort -V | tail -1)" = "$new_yd" ]; then
+            sed -i "s|youtubedl-android:library:$cur_yd|youtubedl-android:library:$new_yd|; s|youtubedl-android:ffmpeg:$cur_yd|youtubedl-android:ffmpeg:$new_yd|" $F
+            changed=true
+            echo "youtubedl-android: $cur_yd -> $new_yd"
+          fi
+
+          echo "changed=$changed" >> "$GITHUB_OUTPUT"
+
+      - name: Build APK
+        id: build
+        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch' || steps.bump.outputs.changed == 'true'
+        continue-on-error: ${{ steps.bump.outputs.changed == 'true' }}
+        run: gradle assembleDebug --no-daemon -PappVersionCode=${{ github.run_number }}
+
+      - name: Revert library update if the build failed
+        if: steps.build.outcome == 'failure' && steps.bump.outputs.changed == 'true'
+        run: |
+          git checkout -- app/build.gradle.kts
+          echo "::warning::Library update broke the build; reverted and nothing was published."
+
+      - name: Rename APK
+        if: steps.build.outcome == 'success'
+        run: cp app/build/outputs/apk/debug/*.apk YtAudio.apk
+
+      - name: Commit library updates
+        if: steps.build.outcome == 'success' && steps.bump.outputs.changed == 'true'
+        run: |
+          git config user.name "github-actions"
+          git config user.email "github-actions@users.noreply.github.com"
+          git commit -am "Update libraries (auto)"
+          git push
+
+      - uses: actions/upload-artifact@v4
+        if: steps.build.outcome == 'success'
+        with:
+          name: YtAudio-apk
+          path: YtAudio.apk
+
+      - name: Publish release (used by in-app updater)
+        if: steps.build.outcome == 'success'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ github.run_number }}
+          name: YtAudio v${{ github.run_number }}
+          body: ${{ github.event.head_commit.message || 'تحديث تلقائي للمكتبات' }}
+          files: YtAudio.apk
+          make_latest: true
